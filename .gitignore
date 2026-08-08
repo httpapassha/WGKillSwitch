@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.app/
+DerivedData/
+
+# Local / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Runtime state (never commit machine-specific data)
+*.log
+daemon_state.json
+desired.json
+status.json
+anchor.conf
+main.pf.conf
+
+# Staging / temp
+/tmp/
+*.tmp
