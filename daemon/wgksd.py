@@ -2,7 +2,7 @@
 """WG Kill Switch root daemon.
 
 Watches WireGuard (any profile via scutil), enforces PF kill-switch when enabled,
-and notifies the console user if WG is down while locking traffic.
+optionally allows Tailscale overlay, and notifies if WG is down while locking traffic.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 BASE = Path("/Library/Application Support/WGKillSwitch")
 DESIRED_PATH = BASE / "desired.json"
@@ -26,8 +26,9 @@ STATE_PATH = BASE / "daemon_state.json"
 POLL_SECONDS = 1.0
 NOTIFY_COOLDOWN = 60.0
 ANCHOR_NAME = "wgkillswitch"
-# After WG reports connected, wait until iface/route settle before opening tunnel.
 HEALTHY_GRACE_TICKS = 1
+
+TAILSCALE_APP = Path("/Applications/Tailscale.app")
 
 
 def log(msg: str) -> None:
@@ -42,23 +43,34 @@ def run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess:
 def ensure_dirs() -> None:
     BASE.mkdir(parents=True, exist_ok=True)
     if not DESIRED_PATH.exists():
-        DESIRED_PATH.write_text(
-            json.dumps({"enabled": False}, indent=2) + "\n", encoding="utf-8"
-        )
+        write_desired({"enabled": False, "allowTailscale": True})
     try:
         os.chmod(DESIRED_PATH, 0o666)
-        # Directory must stay writable so helpers can update desired.json
         os.chmod(BASE, 0o775)
     except PermissionError:
         pass
 
 
-def read_desired() -> bool:
+def write_desired(data: dict[str, Any]) -> None:
+    DESIRED_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(DESIRED_PATH, 0o666)
+    except PermissionError:
+        pass
+
+
+def read_desired() -> dict[str, Any]:
+    """Return desired settings. allowTailscale defaults to True."""
     try:
         data = json.loads(DESIRED_PATH.read_text(encoding="utf-8"))
-        return bool(data.get("enabled", False))
+        if not isinstance(data, dict):
+            return {"enabled": False, "allowTailscale": True}
+        return {
+            "enabled": bool(data.get("enabled", False)),
+            "allowTailscale": bool(data.get("allowTailscale", True)),
+        }
     except Exception:
-        return False
+        return {"enabled": False, "allowTailscale": True}
 
 
 def load_state() -> dict:
@@ -82,7 +94,6 @@ def write_status(status: dict) -> None:
 
 
 def parse_wg_profiles() -> list[dict]:
-    """Return WireGuard profiles from scutil --nc list/show."""
     listed = run(["/usr/sbin/scutil", "--nc", "list"]).stdout
     profiles: list[dict] = []
     pattern = re.compile(
@@ -129,6 +140,7 @@ def parse_endpoint(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
 
 
 def is_tailscale_addr(ip: str) -> bool:
+    """Tailscale CGNAT 100.64.0.0/10 (includes node IPs; MagicDNS is 100.100.100.100)."""
     parts = ip.split(".")
     if len(parts) != 4:
         return False
@@ -137,6 +149,21 @@ def is_tailscale_addr(ip: str) -> bool:
     except ValueError:
         return False
     return a == 100 and 64 <= b <= 127
+
+
+def is_likely_lan_addr(ip: str) -> bool:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    if a == 192 and b == 168:
+        return True
+    if a == 169 and b == 254:
+        return True
+    return False
 
 
 def list_utun_ipv4() -> dict[str, str]:
@@ -163,23 +190,69 @@ def default_route_iface() -> Optional[str]:
     return None
 
 
+def tailscale_installed() -> bool:
+    """True if Tailscale client is present on this Mac (ignores peer list)."""
+    if TAILSCALE_APP.is_dir():
+        return True
+    listed = run(["/usr/sbin/scutil", "--nc", "list"]).stdout
+    if "io.tailscale.ipn.macos" in listed:
+        return True
+    for candidate in (
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "/usr/local/bin/tailscale",
+        "/opt/homebrew/bin/tailscale",
+    ):
+        if Path(candidate).exists():
+            return True
+    return False
+
+
+def tailscale_service_connected() -> bool:
+    listed = run(["/usr/sbin/scutil", "--nc", "list"]).stdout
+    for line in listed.splitlines():
+        if "io.tailscale.ipn.macos" not in line:
+            continue
+        if "(Connected)" in line:
+            return True
+    return False
+
+
+def find_tailscale_ifaces() -> list[str]:
+    """utun interfaces that carry Tailscale addressing — not dependent on peers."""
+    utuns = list_utun_ipv4()
+    return [name for name, ip in sorted(utuns.items()) if is_tailscale_addr(ip)]
+
+
 def find_wg_ifaces(wg_connected: bool) -> list[str]:
-    """All non-Tailscale utuns with IPv4 — any of them may be the active WG tunnel."""
+    """Active WireGuard tunnel ifaces (excludes Tailscale and LAN-looking utuns)."""
     if not wg_connected:
         return []
 
     utuns = list_utun_ipv4()
     candidates = [
-        name for name, ip in sorted(utuns.items()) if not is_tailscale_addr(ip)
+        name
+        for name, ip in sorted(utuns.items())
+        if not is_tailscale_addr(ip) and not is_likely_lan_addr(ip)
     ]
+    if not candidates:
+        # Last resort: any non-Tailscale utun
+        candidates = [
+            name for name, ip in sorted(utuns.items()) if not is_tailscale_addr(ip)
+        ]
     if not candidates:
         return []
 
-    # Prefer putting the current default-route iface first.
     primary = default_route_iface()
     if primary in candidates:
-        return [primary] + [c for c in candidates if c != primary]
-    return candidates
+        return [primary]
+    return [candidates[0]]
+
+
+def physical_ifaces() -> list[str]:
+    """Interfaces where clearnet can leak (Wi‑Fi/Ethernet/etc.)."""
+    out = run(["/sbin/ifconfig", "-l"]).stdout.split()
+    prefixes = ("en", "bridge", "ap", "pdp", "awdl", "llw", "vlan", "gif", "stf")
+    return [n for n in out if n.startswith(prefixes)]
 
 
 def write_main_pf() -> None:
@@ -201,7 +274,12 @@ load anchor "{ANCHOR_NAME}" from "{ANCHOR_PATH}"
 
 
 def write_anchor(
-    enabled: bool, endpoints: list[tuple[str, int]], ifaces: list[str]
+    enabled: bool,
+    endpoints: list[tuple[str, int]],
+    wg_ifaces: list[str],
+    ts_ifaces: list[str],
+    *,
+    allow_tailscale: bool,
 ) -> None:
     if not enabled:
         ANCHOR_PATH.write_text("# kill-switch disabled\npass all\n", encoding="utf-8")
@@ -209,13 +287,14 @@ def write_anchor(
 
     lines = [
         "# WGKillSwitch kill-switch anchor",
-        "block drop out all",
         "pass out quick on lo0 all",
         "pass in quick on lo0 all",
         "pass out quick inet proto udp from any port 68 to any port 67 keep state",
         "pass in quick inet proto udp from any port 67 to any port 68 keep state",
         "pass out quick inet proto udp from any to 255.255.255.255 port 67 keep state",
     ]
+
+    # WG handshake must reach the peer on a physical NIC before the tunnel is up.
     for host, port in endpoints:
         if ":" in host:
             lines.append(
@@ -232,25 +311,52 @@ def write_anchor(
                 f"pass in quick inet proto udp from {host} port {port} to any keep state"
             )
 
-    for iface in ifaces:
+    for iface in wg_ifaces:
         lines.append(f"pass out quick on {iface} all")
         lines.append(f"pass in quick on {iface} all")
+
+    if allow_tailscale:
+        # Coexistence mode: block clearnet *out* on physical NICs only.
+        # Tailscale NE / MagicDNS need a few physical exceptions:
+        # - UDP/41641 peer paths
+        # - DNS/53 upstream used by MagicDNS (otherwise browser hangs on
+        #   console.tailscale.com while dig @1.1.1.1 still works)
+        for iface in ts_ifaces:
+            lines.append("# Tailscale overlay")
+            lines.append(f"pass out quick on {iface} all")
+            lines.append(f"pass in quick on {iface} all")
+        for iface in physical_ifaces():
+            lines.append(
+                f"pass out quick on {iface} proto udp to any port 41641 keep state"
+            )
+            lines.append(
+                f"pass in quick on {iface} proto udp from any port 41641 to any keep state"
+            )
+            lines.append(
+                f"pass out quick on {iface} proto udp to any port 53 keep state"
+            )
+            lines.append(
+                f"pass out quick on {iface} proto tcp to any port 53 keep state"
+            )
+            lines.append(
+                f"pass in quick on {iface} proto udp from any port 53 to any keep state"
+            )
+            lines.append(
+                f"pass in quick on {iface} proto tcp from any port 53 to any keep state"
+            )
+            lines.append(f"block drop out quick on {iface} all")
+    else:
+        # Strict mode: everything blocked except lo0/DHCP/WG.
+        lines.insert(1, "block drop out all")
 
     ANCHOR_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def apply_pf(enabled: bool, state: dict, *, force_full: bool = False) -> tuple[bool, str]:
-    """Apply PF rules.
-
-    Full ruleset load only on enable/disable transitions (or force).
-    Interface/endpoint updates only reload our anchor — avoids breaking
-    Network Extension after WireGuard reconnect.
-    """
     write_main_pf()
     was_enabled = bool(state.get("pfEngaged"))
 
     if not enabled:
-        # Empty/pass our anchor then restore stock ruleset.
         run(["/sbin/pfctl", "-a", ANCHOR_NAME, "-F", "all"])
         res = run(["/sbin/pfctl", "-f", "/etc/pf.conf"])
         err = (res.stderr or res.stdout or "").strip()
@@ -267,16 +373,13 @@ def apply_pf(enabled: bool, state: dict, *, force_full: bool = False) -> tuple[b
         if res.returncode != 0:
             return False, err or "pfctl load failed"
         state["pfEngaged"] = True
-        # Anchor already loaded via main; refresh explicitly.
         run(["/sbin/pfctl", "-a", ANCHOR_NAME, "-f", str(ANCHOR_PATH)])
         return True, err or "full-load ok"
 
-    # Soft update: only our anchor + flush states so reconnect isn't stuck.
     res = run(["/sbin/pfctl", "-a", ANCHOR_NAME, "-f", str(ANCHOR_PATH)])
     err = (res.stderr or res.stdout or "").strip()
     run(["/sbin/pfctl", "-a", ANCHOR_NAME, "-F", "states"])
     if res.returncode != 0:
-        # Fallback to full reload once.
         res2 = run(["/sbin/pfctl", "-f", str(MAIN_PF_PATH)])
         err2 = (res2.stderr or res2.stdout or "").strip()
         run(["/sbin/pfctl", "-a", ANCHOR_NAME, "-f", str(ANCHOR_PATH)])
@@ -328,7 +431,10 @@ def notify(title: str, body: str, state: dict) -> None:
 
 def tick(state: dict) -> dict:
     ensure_dirs()
-    enabled = read_desired()
+    desired = read_desired()
+    enabled = desired["enabled"]
+    allow_ts = desired["allowTailscale"]
+
     profiles = parse_wg_profiles()
     connected = [p for p in profiles if p["connected"]]
     endpoints: list[tuple[str, int]] = []
@@ -342,23 +448,30 @@ def tick(state: dict) -> dict:
 
     wg_ok = len(connected) > 0
     active_name = connected[0]["name"] if connected else None
-    ifaces = find_wg_ifaces(wg_ok)
+    wg_ifaces = find_wg_ifaces(wg_ok)
 
-    # Require both scutil Connected and a real tunnel iface before opening traffic.
-    tunnel_ready = wg_ok and len(ifaces) > 0
+    ts_installed = tailscale_installed()
+    ts_connected = tailscale_service_connected()
+    ts_ifaces_all = find_tailscale_ifaces()
+    # Only punch Tailscale into PF when user asked and client exists.
+    ts_ifaces = ts_ifaces_all if (enabled and allow_ts and ts_installed) else []
+
+    tunnel_ready = wg_ok and len(wg_ifaces) > 0
     if tunnel_ready:
         state["healthyTicks"] = int(state.get("healthyTicks", 0)) + 1
     else:
         state["healthyTicks"] = 0
 
     open_tunnel = tunnel_ready and int(state.get("healthyTicks", 0)) >= HEALTHY_GRACE_TICKS
-    anchor_ifaces = ifaces if open_tunnel else []
+    anchor_wg = wg_ifaces if open_tunnel else []
 
     rules_sig = json.dumps(
         {
             "enabled": enabled,
+            "allowTailscale": allow_ts,
             "endpoints": [[h, p] for h, p in endpoints],
-            "ifaces": anchor_ifaces,
+            "wg": anchor_wg,
+            "ts": ts_ifaces,
         },
         sort_keys=True,
     )
@@ -367,15 +480,23 @@ def tick(state: dict) -> dict:
     lost_tunnel = (not open_tunnel) and bool(state.get("wasOpenTunnel"))
 
     if rules_sig != prev_rules_sig or became_healthy or lost_tunnel:
-        write_anchor(enabled, endpoints, anchor_ifaces)
-        # Full reload only when engaging/disengaging KS; soft reload on reconnect.
+        write_anchor(
+            enabled,
+            endpoints,
+            anchor_wg,
+            ts_ifaces,
+            allow_tailscale=bool(allow_ts and ts_installed),
+        )
         force_full = enabled != bool(state.get("pfEngaged"))
         ok, pf_msg = apply_pf(enabled, state, force_full=force_full)
         state["rulesSig"] = rules_sig
         state["lastPfOk"] = ok
         state["lastPfMessage"] = pf_msg
         if became_healthy:
-            log(f"tunnel restored via {','.join(anchor_ifaces)} — soft PF reload")
+            log(
+                f"tunnel restored via {','.join(anchor_wg)} "
+                f"ts={','.join(ts_ifaces) or '-'} — soft PF reload"
+            )
     else:
         ok = bool(state.get("lastPfOk", True))
         pf_msg = state.get("lastPfMessage", "unchanged")
@@ -400,16 +521,22 @@ def tick(state: dict) -> dict:
     elif not enabled:
         state["alertActive"] = False
 
-    primary_iface = ifaces[0] if ifaces else None
+    primary_iface = wg_ifaces[0] if wg_ifaces else None
+    ts_active_in_pf = bool(ts_ifaces)
     status = {
         "enabled": enabled,
+        "allowTailscale": allow_ts,
+        "tailscaleInstalled": ts_installed,
+        "tailscaleConnected": ts_connected,
+        "tailscaleActive": ts_active_in_pf,
+        "tailscaleInterfaces": ts_ifaces_all,
         "pfOk": ok,
         "pfMessage": pf_msg,
         "wgConnected": wg_ok,
         "tunnelReady": open_tunnel,
         "activeProfile": active_name,
         "interface": primary_iface,
-        "interfaces": ifaces,
+        "interfaces": wg_ifaces,
         "endpoints": [f"{h}:{p}" for h, p in endpoints],
         "profiles": profiles,
         "blocking": enabled,
@@ -425,18 +552,23 @@ def tick(state: dict) -> dict:
 
     sig = [
         enabled,
+        allow_ts,
         wg_ok,
         open_tunnel,
         active_name,
-        ifaces,
+        wg_ifaces,
+        ts_installed,
+        ts_connected,
+        ts_ifaces,
         status["endpoints"],
         ok,
         unhealthy,
     ]
     if state.get("lastSig") != sig:
         log(
-            f"enabled={enabled} wg={active_name or '-'} ifaces={ifaces or '-'} "
-            f"ready={open_tunnel} endpoints={len(endpoints)} unhealthy={unhealthy} pf={ok}"
+            f"enabled={enabled} allowTS={allow_ts} wg={active_name or '-'} "
+            f"wg_if={wg_ifaces or '-'} ts_installed={ts_installed} "
+            f"ts_if={ts_ifaces or '-'} ready={open_tunnel} unhealthy={unhealthy} pf={ok}"
         )
         state["lastSig"] = sig
         save_state(state)
@@ -447,7 +579,6 @@ def main() -> None:
     ensure_dirs()
     log("starting")
     state = load_state()
-    # Don't trust stale pfEngaged across restarts — reconcile on first tick.
     state["pfEngaged"] = False
     state["rulesSig"] = None
     while True:
@@ -455,9 +586,15 @@ def main() -> None:
             state = tick(state)
         except Exception as exc:
             log(f"tick error: {exc!r}")
+            desired = read_desired()
             write_status(
                 {
-                    "enabled": read_desired(),
+                    "enabled": desired["enabled"],
+                    "allowTailscale": desired["allowTailscale"],
+                    "tailscaleInstalled": False,
+                    "tailscaleConnected": False,
+                    "tailscaleActive": False,
+                    "tailscaleInterfaces": [],
                     "pfOk": False,
                     "pfMessage": repr(exc),
                     "wgConnected": False,
@@ -467,7 +604,7 @@ def main() -> None:
                     "interfaces": [],
                     "endpoints": [],
                     "profiles": [],
-                    "blocking": read_desired(),
+                    "blocking": desired["enabled"],
                     "unhealthy": True,
                     "icon": "error",
                 }

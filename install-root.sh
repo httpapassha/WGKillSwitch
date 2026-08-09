@@ -21,10 +21,27 @@ cp "$CTL_SRC" "/usr/local/libexec/wgkillswitch/wgksctl.py"
 chmod 755 "/usr/local/libexec/wgkillswitch/wgksd.py" "/usr/local/libexec/wgkillswitch/wgksctl.py"
 ln -sf "/usr/local/libexec/wgkillswitch/wgksctl.py" "/usr/local/bin/wgksctl"
 
-if [[ ! -f "/Library/Application Support/WGKillSwitch/desired.json" ]]; then
-  printf '%s\n' '{"enabled": false}' > "/Library/Application Support/WGKillSwitch/desired.json"
+DESIRED="/Library/Application Support/WGKillSwitch/desired.json"
+if [[ ! -f "$DESIRED" ]]; then
+  printf '%s\n' '{"enabled": false, "allowTailscale": true}' > "$DESIRED"
+else
+  # Migrate older desired.json that lacked allowTailscale
+  /usr/bin/python3 - <<'PY'
+import json
+from pathlib import Path
+p = Path("/Library/Application Support/WGKillSwitch/desired.json")
+try:
+    data = json.loads(p.read_text())
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+data.setdefault("enabled", False)
+data.setdefault("allowTailscale", True)
+p.write_text(json.dumps(data, indent=2) + "\n")
+PY
 fi
-chmod 666 "/Library/Application Support/WGKillSwitch/desired.json"
+chmod 666 "$DESIRED"
 chmod 775 "/Library/Application Support/WGKillSwitch"
 chmod 755 "/Library/Logs/WGKillSwitch"
 # Ensure status is readable by the menu bar app
