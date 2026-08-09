@@ -11,6 +11,12 @@ struct ProfileInfo: Decodable {
 
 struct Status: Decodable {
     let enabled: Bool
+    let allowTailscale: Bool?
+    let tailscaleInstalled: Bool?
+    let tailscaleConnected: Bool?
+    let tailscaleActive: Bool?
+    let tailscaleInterfaces: [String]?
+    let tailscaleAllowTargets: Int?
     let pfOk: Bool
     let pfMessage: String?
     let wgConnected: Bool
@@ -72,16 +78,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: ctlPath)
         proc.arguments = Array(args)
-        let out = Pipe()
-        let err = Pipe()
-        proc.standardOutput = out
-        proc.standardError = err
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
         do {
             try proc.run()
             proc.waitUntilExit()
             return proc.terminationStatus == 0
         } catch {
-            // Fallback: invoke python helper directly
             let proc2 = Process()
             proc2.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
             proc2.arguments = ["/usr/local/libexec/wgkillswitch/wgksctl.py"] + Array(args)
@@ -101,7 +104,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let status = readStatus()
         lastStatus = status
         updateIcon(status)
-        // Don't rebuild while user is interacting with the menu.
         if !menuIsOpen {
             let fp = menuFingerprint(status)
             if fp != lastMenuFingerprint, let menu = statusItem.menu {
@@ -116,13 +118,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard let status else { return "nil" }
         return [
             status.enabled ? "1" : "0",
+            (status.allowTailscale ?? true) ? "1" : "0",
+            (status.tailscaleInstalled ?? false) ? "1" : "0",
+            (status.tailscaleConnected ?? false) ? "1" : "0",
+            (status.tailscaleActive ?? false) ? "1" : "0",
             status.wgConnected ? "1" : "0",
             status.unhealthy ? "1" : "0",
             status.pfOk ? "1" : "0",
             status.activeProfile ?? "-",
             status.interface ?? "-",
+            String(status.tailscaleAllowTargets ?? 0),
             status.icon,
-            String(status.endpoints.count),
         ].joined(separator: "|")
     }
 
@@ -143,13 +149,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         button.image?.isTemplate = true
 
         if let status {
+            var tip: String
             if status.unhealthy {
-                button.toolTip = "Kill Switch ON — WireGuard down, traffic blocked"
+                tip = "Kill Switch ON — WireGuard down, traffic blocked"
             } else if status.enabled {
-                button.toolTip = "Kill Switch ON — \(status.activeProfile ?? "WireGuard")"
+                tip = "Kill Switch ON — \(status.activeProfile ?? "WireGuard")"
             } else {
-                button.toolTip = "Kill Switch OFF"
+                tip = "Kill Switch OFF"
             }
+            if status.tailscaleInstalled == true {
+                tip += (status.allowTailscale ?? true) ? " · Tailscale OK" : " · Tailscale blocked"
+            }
+            button.toolTip = tip
         }
     }
 
@@ -162,27 +173,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         menu.addItem(.separator())
 
         if let status {
-            let wgLine: String
             if status.wgConnected {
-                wgLine = "WireGuard: \(status.activeProfile ?? "connected")"
+                menu.addItem(disabled("WireGuard: \(status.activeProfile ?? "connected")"))
             } else {
-                wgLine = "WireGuard: не подключён"
+                menu.addItem(disabled("WireGuard: не подключён"))
             }
-            menu.addItem(disabled(wgLine))
-
             if let iface = status.interface {
-                menu.addItem(disabled("Интерфейс: \(iface)"))
+                menu.addItem(disabled("WG интерфейс: \(iface)"))
             }
 
-            let ksLine: String
             if !status.enabled {
-                ksLine = "Kill Switch: выключен"
+                menu.addItem(disabled("Kill Switch: выключен"))
             } else if status.unhealthy {
-                ksLine = "Kill Switch: блокирует (нет WG)"
+                menu.addItem(disabled("Kill Switch: блокирует (нет WG)"))
             } else {
-                ksLine = "Kill Switch: включён"
+                menu.addItem(disabled("Kill Switch: включён"))
             }
-            menu.addItem(disabled(ksLine))
+
+            menu.addItem(.separator())
+
+            if status.tailscaleInstalled == true {
+                var tsLine = "Tailscale: установлен"
+                if status.tailscaleConnected == true {
+                    tsLine += ", в сети"
+                } else {
+                    tsLine += ", не подключён"
+                }
+                menu.addItem(disabled(tsLine))
+                if let ifaces = status.tailscaleInterfaces, !ifaces.isEmpty {
+                    menu.addItem(disabled("TS интерфейс: \(ifaces.joined(separator: ", "))"))
+                }
+                if status.enabled {
+                    let pfLine = (status.allowTailscale ?? true)
+                        ? "С kill-switch: Tailscale разрешён"
+                        : "С kill-switch: Tailscale режется"
+                    menu.addItem(disabled(pfLine))
+                }
+            } else {
+                menu.addItem(disabled("Tailscale: не найден"))
+            }
 
             if !status.pfOk {
                 menu.addItem(disabled("PF: ошибка — см. логи"))
@@ -202,13 +231,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         toggle.target = self
         menu.addItem(toggle)
 
+        let allowTS = status?.allowTailscale ?? true
+        let tsItem = NSMenuItem(
+            title: "Работать с Tailscale",
+            action: #selector(toggleTailscale(_:)),
+            keyEquivalent: "t"
+        )
+        tsItem.target = self
+        tsItem.state = allowTS ? .on : .off
+        tsItem.toolTip = "Control plane + MagicDNS + peers; clearnet всё ещё только через WireGuard"
+        menu.addItem(tsItem)
+
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(
-            title: "Quit",
-            action: #selector(quitApp(_:)),
-            keyEquivalent: "q"
-        )
+        let quit = NSMenuItem(title: "Quit", action: #selector(quitApp(_:)), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }
@@ -247,21 +283,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @objc func toggleKillSwitch(_ sender: Any?) {
         let currently = lastStatus?.enabled ?? false
-        let cmd = currently ? "disable" : "enable"
-        let ok = runCtl(cmd)
+        let ok = runCtl(currently ? "disable" : "enable")
         if !ok {
-            postNotification(title: "WG Kill Switch", body: "Не удалось выполнить \(cmd)")
+            postNotification(title: "WG Kill Switch", body: "Не удалось переключить Kill Switch")
         }
-        // Force menu refresh after ctl
         menuIsOpen = false
         lastMenuFingerprint = ""
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.refresh()
+        }
+    }
+
+    @objc func toggleTailscale(_ sender: Any?) {
+        let ok = runCtl("tailscale-toggle")
+        if !ok {
+            postNotification(title: "WG Kill Switch", body: "Не удалось переключить Tailscale")
+        }
+        menuIsOpen = false
+        lastMenuFingerprint = ""
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             self?.refresh()
         }
     }
 
     @objc func quitApp(_ sender: Any?) {
-        // Prevent LaunchAgent KeepAlive from instantly relaunching.
         let uid = getuid()
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
@@ -283,7 +328,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menuIsOpen = true
-        // Refresh labels once when opening.
         rebuildMenu(status: lastStatus ?? readStatus(), menu: menu)
         lastMenuFingerprint = menuFingerprint(lastStatus)
     }

@@ -19,19 +19,20 @@ Menu-bar kill-switch для официального приложения **Wire
                                          wgkillswitch
 ```
 
-1. **Menu bar app** — включает/выключает kill-switch, показывает статус, шлёт уведомления.
-2. **Демон `wgksd`** (root) — раз в ~1 с читает состояние WireGuard через `scutil`, обновляет PF-правила.
-3. **Любой активный профиль WG** — endpoint’ы всех профилей из WireGuard добавляются в allow-list для handshake, трафик разрешён только через текущий `utun` туннеля.
-4. **Выключение** — PF возвращается к системному `/etc/pf.conf`.
+1. **Menu bar app** — Kill Switch + галочка **Работать с Tailscale**, статус, уведомления.
+2. **Демон `wgksd`** — WireGuard через `scutil`, детект установленного Tailscale (не список пиров), PF.
+3. **Профили WG** — handshake allow-list по всем endpoint’ам, трафик через активный WG `utun`.
+4. **Tailscale (опционально)** — control plane (`192.200.0.0/24` + нужные хосты), MagicDNS upstream, UDP/41641; clearnet всё равно только через WG.
+5. **Выключение** — PF → `/etc/pf.conf`.
 
 ### Что разрешено при включённом kill-switch
 
-- loopback
-- DHCP (чтобы Wi‑Fi мог подняться)
-- UDP handshake до endpoint’ов WireGuard (все известные профили)
-- весь трафик через активный интерфейс туннеля WG
+- loopback, DHCP
+- UDP handshake до WG endpoint’ов
+- весь трафик через WG `utun`
+- если **Работать с Tailscale**: TS `utun`, UDP/41641, TCP/443 к control/admin Tailscale, DNS к 1.1.1.1/8.8.8.8/… для MagicDNS
 
-Всё остальное наружу — drop.
+Остальной clearnet с Wi‑Fi/Ethernet — drop.
 
 ## Требования
 
@@ -61,15 +62,13 @@ cd WGKillSwitch
 
 | Действие | Как |
 |----------|-----|
-| Включить / выключить | Меню-бар → «Включить/Выключить Kill Switch» |
-| Статус | Пункты в том же меню |
-| Выйти из приложения | Quit (демон kill-switch продолжает работать) |
-| CLI | см. ниже |
+| Kill Switch | Меню → Включить / Выключить |
+| Tailscale | Меню → галочка **Работать с Tailscale** (по умолчанию вкл.) |
+| Quit | только UI; демон KS продолжает работать |
 
 ```bash
-wgksctl enable
-wgksctl disable
-wgksctl toggle
+wgksctl enable|disable|toggle
+wgksctl tailscale-on|tailscale-off|tailscale-toggle
 wgksctl status
 ```
 
@@ -122,7 +121,7 @@ WGKillSwitch/
 - Kill-switch реализован через системный **PF**, не через скрытую опцию WireGuard.app (в официальном клиенте на macOS её нет).
 - Демон работает от root — это нужно для `pfctl`.
 - `desired.json` доступен на запись пользователю, чтобы UI мог переключать режим без пароля каждый раз.
-- Tailscale и другие VPN не считаются «разрешённым» туннелем: при включённом KS их трафик тоже режется, если он не идёт через WireGuard.
+- При выключенной галочке Tailscale — строгий режим (только WG). При включённой — узкие исключения под control plane/MagicDNS/peers, не весь интернет.
 - Это не App Store-сборка и не notarized binary: Gatekeeper может спросить подтверждение при первом запуске на другом Mac.
 
 ## Лицензия
